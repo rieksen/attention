@@ -1,42 +1,83 @@
 """
-Summarisation and saliency scoring using flan-t5-base.
-
-Saliency approach:
-  1. Split input into sentences.
-  2. Run T5 with output_attentions=True to get cross-attention weights
-     (decoder attending to encoder tokens).
-  3. For each encoder token, average attention received across all decoder
-     steps and all attention heads → token saliency score.
-  4. Map token scores back to sentences by aligning tokenised spans.
-  5. Normalise sentence scores to [0, 1].
+Summarisation via Hugging Face Inference API (facebook/bart-large-cnn).
+Saliency computed by sentence-summary word overlap — no local model needed.
 """
 
 import re
+import os
+import time
+import requests
 import numpy as np
-import torch
-from transformers import T5ForConditionalGeneration, T5Tokenizer
+from typing import List
 
-MODEL_NAME = "google/flan-t5-base"
-
-_tokenizer = None
-_model = None
+HF_API_URL = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 
-def _load():
-    global _tokenizer, _model
-    if _model is None:
-        _tokenizer = T5Tokenizer.from_pretrained(MODEL_NAME)
-        _model = T5ForConditionalGeneration.from_pretrained(
-            MODEL_NAME, output_attentions=True
-        )
-        _model.eval()
+def _hf_headers():
+    return {"Authorization": f"Bearer {HF_TOKEN}"}
 
 
-def split_sentences(text: str) -> list[str]:
-    """Simple sentence splitter that preserves structure."""
+def split_sentences(text: str) -> List[str]:
     text = text.strip()
     sentences = re.split(r'(?<=[.!?])\s+', text)
     return [s.strip() for s in sentences if s.strip()]
+
+
+def _call_hf(text: str, retries: int = 5) -> str:
+    """Call HF Inference API, retrying if model is loading."""
+    # BART has a 1024 token limit — truncate input
+    truncated = text[:3000]
+    payload = {
+        "inputs": truncated,
+        "parameters": {
+            "max_length": 150,
+            "min_length": 50,
+            "do_sample": False,
+        }
+    }
+    for attempt in range(retries):
+        resp = requests.post(HF_API_URL, headers=_hf_headers(), json=payload, timeout=60)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and data:
+                return data[0].get("summary_text", "")
+            return ""
+        elif resp.status_code == 503:
+            # Model is loading — wait and retry
+            wait = resp.json().get("estimated_time", 20)
+            time.sleep(min(wait, 30))
+        else:
+            resp.raise_for_status()
+    raise RuntimeError("HF Inference API unavailable after retries.")
+
+
+def _sentence_saliency(sentences: List[str], summary: str) -> List[float]:
+    """
+    Score each sentence by normalised word overlap with the summary.
+    Simple but effective — sentences the model drew from score higher.
+    """
+    summary_words = set(re.findall(r'\w+', summary.lower()))
+    if not summary_words:
+        return [0.5] * len(sentences)
+
+    scores = []
+    for sent in sentences:
+        sent_words = set(re.findall(r'\w+', sent.lower()))
+        if not sent_words:
+            scores.append(0.0)
+            continue
+        overlap = len(sent_words & summary_words) / len(sent_words)
+        scores.append(overlap)
+
+    # Normalise to [0, 1]
+    mn, mx = min(scores), max(scores)
+    if mx > mn:
+        scores = [(s - mn) / (mx - mn) for s in scores]
+    else:
+        scores = [0.5] * len(scores)
+
+    return scores
 
 
 def summarise_and_score(text: str) -> dict:
@@ -47,95 +88,14 @@ def summarise_and_score(text: str) -> dict:
             "sentences": [{"index": int, "text": str, "score": float}, ...]
         }
     """
-    _load()
-
-    # Truncate to T5's max input (512 tokens)
-    prompt = f"summarize: {text}"
-    inputs = _tokenizer(
-        prompt,
-        return_tensors="pt",
-        max_length=512,
-        truncation=True,
-        padding=False,
-    )
-    input_ids = inputs["input_ids"]         # (1, seq_len)
-    input_len = input_ids.shape[1]
-
-    with torch.no_grad():
-        outputs = _model.generate(
-            input_ids,
-            max_new_tokens=150,
-            num_beams=4,
-            early_stopping=True,
-            output_attentions=True,
-            return_dict_in_generate=True,
-        )
-
-    summary_ids = outputs.sequences[0]
-    summary = _tokenizer.decode(summary_ids, skip_special_tokens=True)
-
-    # ── Extract cross-attention weights ──────────────────────────────────────
-    # cross_attentions: tuple of decoder steps, each is tuple of layers,
-    # each tensor is (batch, heads, 1, encoder_seq_len)
-    cross_attentions = outputs.cross_attentions   # may be None if beam search
-    token_scores = np.zeros(input_len)
-
-    if cross_attentions is not None:
-        for step_attns in cross_attentions:
-            # step_attns: tuple over layers
-            for layer_attn in step_attns:
-                # layer_attn: (batch, heads, 1, enc_len) or (batch*beams, ...)
-                attn = layer_attn[0]              # first beam/batch
-                attn = attn.mean(dim=0)           # average heads → (1, enc_len)
-                attn = attn[0].cpu().numpy()      # (enc_len,)
-                # Pad/trim to input_len
-                length = min(len(attn), input_len)
-                token_scores[:length] += attn[:length]
-
-        # Normalise
-        if token_scores.max() > 0:
-            token_scores = token_scores / token_scores.max()
-
-    # ── Map token scores to sentences ────────────────────────────────────────
+    summary = _call_hf(text)
     sentences = split_sentences(text)
-    sentence_scores = []
+    scores = _sentence_saliency(sentences, summary)
 
-    # Re-tokenise prompt to find character spans per token
-    token_offsets = _tokenizer(
-        prompt,
-        return_offsets_mapping=True,
-        max_length=512,
-        truncation=True,
-    )["offset_mapping"]
-
-    prompt_prefix_len = len("summarize: ")
-
-    for idx, sent in enumerate(sentences):
-        # Find where this sentence appears in the original text
-        sent_start = text.find(sent)
-        sent_end = sent_start + len(sent)
-
-        scores_for_sentence = []
-        for tok_idx, (char_start, char_end) in enumerate(token_offsets):
-            # Adjust for "summarize: " prefix
-            adj_start = char_start - prompt_prefix_len
-            adj_end = char_end - prompt_prefix_len
-            if adj_end <= sent_start or adj_start >= sent_end:
-                continue
-            if tok_idx < len(token_scores):
-                scores_for_sentence.append(float(token_scores[tok_idx]))
-
-        score = float(np.mean(scores_for_sentence)) if scores_for_sentence else 0.0
-        sentence_scores.append({"index": idx, "text": sent, "score": score})
-
-    # Normalise sentence scores to [0, 1]
-    raw = [s["score"] for s in sentence_scores]
-    if max(raw) > 0:
-        mn, mx = min(raw), max(raw)
-        for s in sentence_scores:
-            s["score"] = round((s["score"] - mn) / (mx - mn + 1e-9), 4) if mx > mn else 0.5
-    else:
-        for s in sentence_scores:
-            s["score"] = 0.5
-
-    return {"summary": summary, "sentences": sentence_scores}
+    return {
+        "summary": summary,
+        "sentences": [
+            {"index": i, "text": s, "score": round(scores[i], 4)}
+            for i, s in enumerate(sentences)
+        ]
+    }

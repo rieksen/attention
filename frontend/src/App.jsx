@@ -118,7 +118,7 @@ export default function App() {
             {loading && (
               <div className="loading-state">
                 <div className="spinner" />
-                <p>Running T5 summarisation…</p>
+                <p>Running BART summarisation…</p>
                 <p className="loading-sub">Extracting attention weights</p>
               </div>
             )}
@@ -129,7 +129,7 @@ export default function App() {
                 {/* Summary */}
                 <div className="summary-card">
                   <div className="section-label">
-                    Summary <span className="model-tag">flan-t5-base</span>
+                    Summary <span className="model-tag">bart-large-cnn</span>
                   </div>
                   <p className="summary-text">{result.summary}</p>
                   <div className="summary-meta">

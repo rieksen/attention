@@ -24,7 +24,7 @@ def create_summary(
         sentences=result["sentences"],
         word_count=len(text.split()),
         char_count=len(text),
-        model_used="google/flan-t5-base",
+        model_used="facebook/bart-large-cnn",
     )
     db.add(doc)
     db.commit()
